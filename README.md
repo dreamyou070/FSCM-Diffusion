@@ -1,3 +1,4 @@
+<div align="center" style="max-width: 800px; margin: auto;">
 <h1 align="center">FSCM-Diffusion: Stepwise Control of Climate Phenomena using Fused Structural Condition Maps</h1>
 
 
@@ -12,3 +13,4 @@
 - Style-LoRA integration
 
 ## 📁 Project Structure
+</div>
