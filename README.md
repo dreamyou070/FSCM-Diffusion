@@ -66,7 +66,8 @@ As the level increases, more of the scene becomes submerged.
 
 ## 📁 Ablation Study
 
-![Ablation Figure 1](assets/Figure6.png)  
+![Ablation Figure 1](assets/Figure6.png) 
+effect of style LoRA
 ![Ablation Figure 2](assets/Figure7.png)
 
 ---
