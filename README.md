@@ -11,4 +11,10 @@
 - Level-based flood/snow control
 - Style-LoRA integration
 
-## 📁 Project Structure
+## 📁 Model Pipeline
+![설명 텍스트](assets/Figure2.png)
+
+## 📁 Ablatino Stury
+![설명 텍스트](assets/Figure6.png)
+![설명 텍스트](assets/Figure7.png)
+
