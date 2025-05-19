@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 import argparse
 from torchvision import transforms
 import torch
@@ -148,3 +149,100 @@ if __name__ == '__main__':
     parser.add_argument("--class_label_list", type=int, nargs="+", default=[0,1,2])
     args = parser.parse_args()
     main(args)
+=======
+import argparse
+import os, json, time
+from PIL import Image
+import torch
+from torchvision import transforms
+import numpy as np
+
+from diffusers.image_processor import VaeImageProcessor
+from model.structuredlatent import CustomStructuredConv
+from model.unet_model import UNet2DConditionModel
+from model.climatecontrol_pipeline import ClimateControlPipeline
+from utils.base import convert_to_np
+
+def load_image_tensor(image_path, resolution, device, dtype):
+    image = Image.open(image_path).convert("RGB").resize((resolution, resolution))
+    array = convert_to_np(image, resolution)
+    tensor = torch.tensor(array).unsqueeze(0).to(device=device, dtype=dtype)
+    tensor = 2 * (tensor / 255) - 1
+    return tensor
+
+def main(args):
+    device = torch.device(args.device)
+    dtype = torch.float16
+
+    print("[Step 1] Load pipeline...")
+    pipe = ClimateControlPipeline.from_pretrained(
+        args.base_model_id, torch_dtype=dtype
+    ).to(device)
+
+    print("[Step 2] Load UNet checkpoint...")
+    unet_path = os.path.join(args.checkpoint_dir, "unet")
+    unet = UNet2DConditionModel.from_pretrained(unet_path, torch_dtype=dtype).to(device)
+    pipe.unet = unet.eval()
+
+    if args.use_fused_conditionmap:
+        print("[Step 3] Load structured condition model...")
+        structure_model = CustomStructuredConv(in_channels=5, out_channels=1)
+        state_dict = torch.load(os.path.join(args.checkpoint_dir, "structured_obj.bin"), map_location='cpu')
+        structure_model.load_state_dict(state_dict)
+        pipe.set_condition_model(structure_model.to(device))
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    seed = torch.Generator(device).manual_seed(args.seed)
+    mask_processor = VaeImageProcessor(vae_scale_factor=8, do_normalize=False, do_binarize=False,
+                                       do_resize=True, do_convert_grayscale=True)
+
+    print("[Step 4] Load input image and conditions...")
+    image = Image.open(args.rgb_path).convert("RGB").resize((args.resolution, args.resolution))
+    depth = Image.open(args.depth_path).convert("L")
+    normal_tensor = load_image_tensor(args.normal_path, args.resolution, device, dtype)
+    normal_latent = pipe.vae.encode(normal_tensor).latent_dist.mode()
+
+    class_labels = torch.LongTensor([args.class_label]).to(device)
+
+    print("[Step 5] Run inference...")
+    edited = pipe(
+        prompt=args.prompt,
+        image=image,
+        class_labels=class_labels,
+        depth_image=depth if args.use_depthmap else None,
+        mask_processor=mask_processor if args.use_depthmap else None,
+        normal_map_latent=normal_latent,
+        structure_guidance_scale=args.structure_guidance_scale,
+        use_fused_condition=args.use_fused_conditionmap,
+        num_inference_steps=args.num_inference_steps,
+        image_guidance_scale=args.image_guidance_scale,
+        generator=seed,
+    ).images[0]
+
+    save_name = f"{args.output_name}.png"
+    edited.save(os.path.join(args.output_dir, save_name))
+    print(f"[Done] Saved to {os.path.join(args.output_dir, save_name)}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--base_model_id", type=str, required=True)
+    parser.add_argument("--checkpoint_dir", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, default="./results")
+    parser.add_argument("--output_name", type=str, default="edited_output")
+    parser.add_argument("--rgb_path", type=str, required=True)
+    parser.add_argument("--depth_path", type=str, required=True)
+    parser.add_argument("--normal_path", type=str, required=True)
+    parser.add_argument("--prompt", type=str, required=True)
+    parser.add_argument("--class_label", type=int, default=0)
+    parser.add_argument("--resolution", type=int, default=256)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num_inference_steps", type=int, default=20)
+    parser.add_argument("--image_guidance_scale", type=float, default=1.5)
+    parser.add_argument("--structure_guidance_scale", type=float, default=1.5)
+    parser.add_argument("--use_fused_conditionmap", action="store_true")
+    parser.add_argument("--use_depthmap", action="store_true")
+    args = parser.parse_args()
+
+    main(args)
+>>>>>>> b3c1d29 (train_more)
