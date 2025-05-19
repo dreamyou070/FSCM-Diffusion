@@ -1,4 +1,3 @@
-
 import inspect
 from sndhdr import tests
 from typing import Any, Callable, Dict, List, Optional, Union
@@ -6,7 +5,6 @@ import numpy as np
 import PIL.Image
 import torch
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
-
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.image_processor import PipelineImageInput, VaeImageProcessor
 from diffusers.loaders import FromSingleFileMixin, IPAdapterMixin, StableDiffusionLoraLoaderMixin, TextualInversionLoaderMixin
@@ -27,7 +25,6 @@ else:
     XLA_AVAILABLE = False
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
-
 
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img.preprocess
 def preprocess(image):
@@ -51,7 +48,6 @@ def preprocess(image):
     elif isinstance(image[0], torch.Tensor):
         image = torch.cat(image, dim=0)
     return image
-
 
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img.retrieve_latents
 def retrieve_latents(
@@ -122,6 +118,7 @@ class ClimateControlPipeline(
         feature_extractor: CLIPImageProcessor,
         image_encoder: Optional[CLIPVisionModelWithProjection] = None,
         requires_safety_checker: bool = True,
+
     ):
         super().__init__()
 
@@ -165,7 +162,6 @@ class ClimateControlPipeline(
         num_inference_steps: int = 100,
         guidance_scale: float = 7.5,
         image_guidance_scale: float = 1.5,
-        structure_guidance_scale: float = 1.5,
         negative_prompt: Optional[Union[str, List[str]]] = None,
         num_images_per_prompt: Optional[int] = 1,
         eta: float = 0.0,
@@ -181,14 +177,22 @@ class ClimateControlPipeline(
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         class_labels: Optional[torch.Tensor] = None, #
+        neg_class_label=None,
         mask_processor = None,
         use_fused_condition = False,
         pyramid_noise = False,
         timewise_condition=False,
         perlin_noise=False,
         second_perlin_noise=False,
-        dropout_prob: float = 0.0, # always use s_latent
+            do_third_negative_label_guidance=False,
+        dropout_prob: float = 0.0,
             label_embedding_dict = None,
+            do_negative_level_guidance = False,
+            do_prompt_control = False,
+            test_second = False,
+            test_third = False,
+            start_timestep = 0,
+            reverse = False,
         **kwargs,):
 
         callback = kwargs.pop("callback", None)
@@ -223,7 +227,6 @@ class ClimateControlPipeline(
         )
         self._guidance_scale = guidance_scale
         self._image_guidance_scale = image_guidance_scale
-        self._structure_guidance_scale = structure_guidance_scale
 
 
         device = self._execution_device
@@ -248,33 +251,31 @@ class ClimateControlPipeline(
                                             self.do_classifier_free_guidance, # * 3
                                             negative_prompt,
                                             prompt_embeds=prompt_embeds,
-                                            negative_prompt_embeds=negative_prompt_embeds,)
+                                            negative_prompt_embeds=negative_prompt_embeds,
+                                            reverse = reverse)
         dtype = prompt_embeds.dtype
 
         if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
-            image_embeds = self.prepare_ip_adapter_image_embeds(
-                ip_adapter_image,
-                ip_adapter_image_embeds,
-                device,
-                batch_size * num_images_per_prompt,
-                self.do_classifier_free_guidance,
-            )  # [2,1,257,1280]
+            image_embeds = self.prepare_ip_adapter_image_embeds(ip_adapter_image,
+                                                                ip_adapter_image_embeds,
+                                                                device,
+                                                                batch_size * num_images_per_prompt,
+                                                                self.do_classifier_free_guidance,)  # [2,1,257,1280]
+
         # 3. Preprocess image
         image = self.image_processor.preprocess(image)
 
         # 4. set timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
-
         # 5. Prepare Image latents
-        image_latents = self.prepare_image_latents(
-            image,
-            batch_size,
-            num_images_per_prompt,
-            prompt_embeds.dtype,
-            device,
-            self.do_classifier_free_guidance,
-        )
+        image_latents = self.prepare_image_latents(image,
+                                                   batch_size,
+                                                   num_images_per_prompt,
+                                                   prompt_embeds.dtype,
+                                                   device,
+                                                   self.do_classifier_free_guidance,
+                                                   reverse)
 
         height, width = image_latents.shape[-2:]
         height = height * self.vae_scale_factor
@@ -332,39 +333,67 @@ class ClimateControlPipeline(
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
         added_cond_kwargs = {"image_embeds": image_embeds} if ip_adapter_image is not None else None
 
+
+
+
+
+
         # 9. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
-
         with self.progress_bar(total=num_inference_steps) as progress_bar:
 
             for i, t in enumerate(timesteps):
 
                 latent_model_input = torch.cat([latents] * 3) if self.do_classifier_free_guidance else latents
                 scaled_latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-                # /src/depth/normal
                 scaled_latent_model_input = torch.cat([scaled_latent_model_input, image_latents], dim=1)
 
                 # -------------------------------------------------------------------------------------
                 # 9.1 Level Embedding
                 # -------------------------------------------------------------------------------------
                 input_class_labels = class_labels
-                input_class_labels = torch.cat([class_labels, class_labels, class_labels], dim=0) # just int style be go ???
+                input_class_labels = torch.cat([class_labels, class_labels, class_labels], dim=0)
+                int_time = int(t.item())
+
+                if do_negative_level_guidance and test_second and int_time < start_timestep :
+                    print(f' do negaive level guidance [second]')
+                    class_int = int(class_labels.item())
+                    negative_level = 0
+                    if class_int > 0 :
+                        negative_level = class_int - 1
+
+
+                    if reverse :
+                        negative_level = 0
+                    negative_level = torch.tensor([negative_level]).to(device=device).long()
+                    input_class_labels = torch.cat([class_labels, negative_level, negative_level], dim=0)
+
+                if do_negative_level_guidance and neg_class_label is not None and int_time < start_timestep :
+                    negative_level = torch.tensor([neg_class_label]).to(device=device).long()
+                    input_class_labels = torch.cat([class_labels, negative_level, negative_level], dim=0)
+
+
+                print(f' timestep input_class_labels = {input_class_labels}')
                 noise_pred = self.unet(scaled_latent_model_input,
-                                       t,
-                                       encoder_hidden_states=prompt_embeds,
+                                       timestep = t,                                   # [batch=1, dim]
+                                       encoder_hidden_states=prompt_embeds, # [batch=2, lengh, dim]
                                        added_cond_kwargs=added_cond_kwargs, # image_embeds = [2,1,257,1280]
                                        class_labels=input_class_labels,
                                        cross_attention_kwargs=cross_attention_kwargs,
                                        return_dict=False,)[0]
-                # perform guidance
+
                 if self.do_classifier_free_guidance:
-                    ###############
+
                     noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
                     noise_pred = (
                             noise_pred_uncond
                             + self.guidance_scale * (noise_pred_text - noise_pred_image)
                             + self.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
                     )
+
+                    #self.guidance_scale = 0
+                    #print(f' [cfg] self.guidance_scale = {self.guidance_scale} | self.image_guidance_scale = {self.image_guidance_scale}')
+
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
 
                 if callback_on_step_end is not None:
@@ -419,6 +448,7 @@ class ClimateControlPipeline(
         negative_prompt=None,
         prompt_embeds: Optional[torch.Tensor] = None,
         negative_prompt_embeds: Optional[torch.Tensor] = None,
+            reverse = False,
     ):
 
         if prompt is not None and isinstance(prompt, str):
@@ -444,11 +474,8 @@ class ClimateControlPipeline(
             text_input_ids = text_inputs.input_ids
             untruncated_ids = self.tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
 
-            if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(
-                text_input_ids, untruncated_ids
-            ):
-                removed_text = self.tokenizer.batch_decode(
-                    untruncated_ids[:, self.tokenizer.model_max_length - 1 : -1]
+            if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
+                removed_text = self.tokenizer.batch_decode(untruncated_ids[:, self.tokenizer.model_max_length - 1 : -1]
                 )
                 logger.warning(
                     "The following part of your input was truncated because CLIP can only handle sequences up to"
@@ -566,7 +593,7 @@ class ClimateControlPipeline(
             return image_embeds, uncond_image_embeds
 
     def prepare_ip_adapter_image_embeds(
-        self, ip_adapter_image, ip_adapter_image_embeds, device, num_images_per_prompt, do_classifier_free_guidance
+        self, ip_adapter_image, ip_adapter_image_embeds, device, num_images_per_prompt, do_classifier_free_guidance, reverse
     ):
         if ip_adapter_image_embeds is None:
             if not isinstance(ip_adapter_image, list):
@@ -593,6 +620,7 @@ class ClimateControlPipeline(
 
                 if do_classifier_free_guidance:
                     single_image_embeds = torch.cat([single_image_embeds, single_negative_image_embeds, single_negative_image_embeds])
+
                     single_image_embeds = single_image_embeds.to(device)
                 # single_image_embeds = [2,1,257,1280]
                 image_embeds.append(single_image_embeds)
@@ -760,7 +788,7 @@ class ClimateControlPipeline(
         self.structured_obj = structured_obj
 
     def prepare_image_latents(
-        self, image, batch_size, num_images_per_prompt, dtype, device, do_classifier_free_guidance, generator=None
+        self, image, batch_size, num_images_per_prompt, dtype, device, do_classifier_free_guidance, reverse
     ):
         if not isinstance(image, (torch.Tensor, PIL.Image.Image, list)):
             raise ValueError(
@@ -796,6 +824,7 @@ class ClimateControlPipeline(
 
         if do_classifier_free_guidance:
             uncond_image_latents = torch.zeros_like(image_latents)
+
             image_latents = torch.cat([image_latents, image_latents, uncond_image_latents], dim=0)
 
         return image_latents
@@ -808,9 +837,7 @@ class ClimateControlPipeline(
     def image_guidance_scale(self):
         return self._image_guidance_scale
 
-    @property
-    def structure_guidance_scale(self):
-        return self._structure_guidance_scale
+
 
     @property
     def num_timesteps(self):
@@ -821,4 +848,4 @@ class ClimateControlPipeline(
     # corresponds to doing no classifier free guidance.
     @property
     def do_classifier_free_guidance(self):
-        return self.guidance_scale > 1.0 and self.structure_guidance_scale >= 1.0
+        return self.guidance_scale > 1.0

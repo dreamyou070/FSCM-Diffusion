@@ -1,0 +1,60 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Virtual environment
+env/
+venv/
+.venv/
+
+# PyTorch/TF checkpoints
+*.ckpt
+*.pth
+*.pt
+*.h5
+*.pb
+
+# Diffusion model weights, LoRA, etc.
+*.safetensors
+*.bin
+*.ckpt
+
+# HuggingFace cache
+~/.cache/huggingface/
+*.cache/
+*.token
+*.log
+
+# VSCode / PyCharm
+.vscode/
+.idea/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Logs and temp files
+*.log
+*.tmp
+*.bak
+
+# Docker artifacts
+*.pid
+*.sock
+*.db
+*.pidfile
+
+# Datasets and outputs (customize as needed)
+data/
+output/
+runs/
+checkpoints/
+
+# Ignore entire 'result' directory
+result/
+.venv/
+*.ckpt

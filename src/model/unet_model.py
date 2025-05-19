@@ -863,9 +863,11 @@ class UNet2DConditionModel(
             self.set_attn_processor(self.original_attn_processors)
 
     def get_time_embed(
-        self, sample: torch.Tensor, timestep: Union[torch.Tensor, float, int]
-    ) -> Optional[torch.Tensor]:
+        self, sample: torch.Tensor,
+            timestep: Union[torch.Tensor, float, int]) -> Optional[torch.Tensor]:
+
         timesteps = timestep
+
         if not torch.is_tensor(timesteps):
             # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
             # This would be a good case for the `match` statement (Python 3.10+)
@@ -876,16 +878,14 @@ class UNet2DConditionModel(
             else:
                 dtype = torch.int32 if (is_mps or is_npu) else torch.int64
             timesteps = torch.tensor([timesteps], dtype=dtype, device=sample.device)
+
         elif len(timesteps.shape) == 0:
             timesteps = timesteps[None].to(sample.device)
 
-        # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+        # ---------------------------------------------------------------------------------------------------- #
+        # broden to batch dimension in a way that's compatible with ONNX/Core ML
         timesteps = timesteps.expand(sample.shape[0])
-
         t_emb = self.time_proj(timesteps)
-        # `Timesteps` does not contain any weights and will always return f32 tensors
-        # but time_embedding might actually be running in fp16. so we need to cast here.
-        # there might be better ways to encapsulate this.
         t_emb = t_emb.to(dtype=sample.dtype)
         return t_emb
 
@@ -893,16 +893,17 @@ class UNet2DConditionModel(
                         sample: torch.Tensor,
                         class_labels: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         class_emb = None
+
         if self.class_embedding is not None:
             if class_labels is None:
                 raise ValueError("class_labels should be provided when num_class_embeds > 0")
+            # ------------------------------------------------------------------------------------------ #
             if self.config.class_embed_type == "timestep":
                 class_labels = self.time_proj(class_labels)
-                # `Timesteps` does not contain any weights and will always return f32 tensors
-                # there might be better ways to encapsulate this.
                 class_labels = class_labels.to(dtype=sample.dtype)
+            # ------------------------------------------------------------------------------------------ #
+            # class_labels = [0,0,0]
             class_emb = self.class_embedding(class_labels).to(dtype=sample.dtype)
-
         return class_emb
 
     def get_aug_embed(
@@ -1014,12 +1015,12 @@ class UNet2DConditionModel(
         structured_latents = None,
     ) -> Union[UNet2DConditionOutput, Tuple]:
 
+
         default_overall_up_factor = 2**self.num_upsamplers
         forward_upsample_size = False
         upsample_size = None
         for dim in sample.shape[-2:]:
             if dim % default_overall_up_factor != 0:
-                # Forward upsample size to force interpolation output size.
                 forward_upsample_size = True
                 break
 
@@ -1030,25 +1031,17 @@ class UNet2DConditionModel(
             encoder_attention_mask = (1 - encoder_attention_mask.to(sample.dtype)) * -10000.0
             encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
 
-        # 0. center input if necessary
+        # 0. center input if necessary (3,4,64,64)
         if self.config.center_input_sample:
             sample = 2 * sample - 1.0
-        # 1. time
-        #print(f'sample = {sample.shape}')
-        t_emb = self.get_time_embed(sample=sample, timestep=timestep)
-        emb = self.time_embedding(t_emb, timestep_cond) # [batch, 1280]
 
-        #
-        class_emb = self.get_class_embed(sample=sample,
-                                         class_labels=class_labels) # [batch, 1280]
-        #print(f'emb = {emb.shape} | class_emb = {class_emb.shape}')
+        # ------------------------------------------------------------------------------------------------ #
+        # [1] make class level augmented time embedding
+        t_emb = self.get_time_embed(sample=sample, timestep=timestep) # [3,dim]
+        emb = self.time_embedding(t_emb, timestep_cond)
+        class_emb = self.get_class_embed(sample=sample,class_labels=class_labels) # [batch=3, 1280]
         if class_emb is not None:
-            #if self.config.class_embeddings_concat:
-            #    emb = torch.cat([emb, class_emb], dim=-1) # batch, 2560 (why 3840?)
-            #else:
-            #emb = emb + class_emb
             emb = torch.cat([emb, class_emb], dim=-1)  # batch=3, 2560
-
         aug_emb = self.get_aug_embed(emb=emb,
                                      encoder_hidden_states=encoder_hidden_states,
                                      added_cond_kwargs=added_cond_kwargs) # None
@@ -1059,39 +1052,32 @@ class UNet2DConditionModel(
         if self.time_embed_act is not None:
             emb = self.time_embed_act(emb)
 
-        # encoder_hidden_states before added condition = [3,77,768]
+        # ------------------------------------------------------------------------------------------------ #
+        # [2] text embedding
         encoder_hidden_states = self.process_encoder_hidden_states(encoder_hidden_states=encoder_hidden_states,
                                                                    added_cond_kwargs=added_cond_kwargs)
+
+        # ------------------------------------------------------------------------------------------------ #
+        # [3] image embedding
         if structured_latents is not None:
             device = encoder_hidden_states.device
             dtype = encoder_hidden_states.dtype
             structured_latents = self.structured_conv_in.to(device=device, dtype=dtype)(structured_latents) # channel = 1
             sample = torch.cat([sample, structured_latents], dim=1) # 4 / 4 / 1 : 9 -> 320
         sample = self.conv_in(sample) # 9 -> 320
-        # 2.5 GLIGEN position net
         if cross_attention_kwargs is not None and cross_attention_kwargs.get("gligen", None) is not None:
             cross_attention_kwargs = cross_attention_kwargs.copy()
             gligen_args = cross_attention_kwargs.pop("gligen")
             cross_attention_kwargs["gligen"] = {"objs": self.position_net(**gligen_args)}
-        # 3. down
-        # we're popping the `scale` instead of getting it because otherwise `scale` will be propagated
-        # to the internal blocks and will raise deprecation warnings. this will be confusing for our users.
         if cross_attention_kwargs is not None:
             cross_attention_kwargs = cross_attention_kwargs.copy()
             lora_scale = cross_attention_kwargs.pop("scale", 1.0)
         else:
             lora_scale = 1.0
-
         if USE_PEFT_BACKEND:
-            # weight the lora layers by setting `lora_scale` for each PEFT layer
             scale_lora_layers(self, lora_scale)
-
         is_controlnet = mid_block_additional_residual is not None and down_block_additional_residuals is not None
-        # using new arg down_intrablock_additional_residuals for T2I-Adapters, to distinguish from controlnets
         is_adapter = down_intrablock_additional_residuals is not None
-        # maintain backward compatibility for legacy usage, where
-        #       T2I-Adapter and ControlNet both use down_block_additional_residuals arg
-        #       but can only use one or the other
         if not is_adapter and mid_block_additional_residual is None and down_block_additional_residuals is not None:
             deprecate(
                 "T2I should not use down_block_additional_residuals",
@@ -1103,7 +1089,6 @@ class UNet2DConditionModel(
             )
             down_intrablock_additional_residuals = down_block_additional_residuals
             is_adapter = True
-
         down_block_res_samples = (sample,)
         for downsample_block in self.down_blocks:
             if hasattr(downsample_block, "has_cross_attention") and downsample_block.has_cross_attention:
@@ -1111,7 +1096,6 @@ class UNet2DConditionModel(
                 additional_residuals = {}
                 if is_adapter and len(down_intrablock_additional_residuals) > 0:
                     additional_residuals["additional_residuals"] = down_intrablock_additional_residuals.pop(0)
-
                 sample, res_samples = downsample_block(hidden_states=sample,
                                                        temb=emb, # final emb = [batch, 1280*2]
                                                        encoder_hidden_states=encoder_hidden_states, # [batch, 77, 768]

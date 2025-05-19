@@ -54,13 +54,15 @@ from utils.call_dataset import tokenize_captions, load_dataloader
 from utils.call_styledataset import build_style_dataloader
 from model.climatecontrol_pipeline import ClimateControlPipeline
 from model.unet_model import UNet2DConditionModel  # 만약 커스텀이면 여기 유지
-# from model.structuredlatent import CustomStructuredConv
+import torch.nn as nn
+from diffusers.image_processor import VaeImageProcessor
 
 
 logger = get_logger(__name__, log_level="INFO")
 WANDB_TABLE_COL_NAMES = ["original_image", "edited_image", "edit_prompt"]
 
-DATASET_NAME_MAPPING = {"fusing/instructpix2pix-1000-samples": ("input_image", "edit_prompt", "edited_image"),}
+DATASET_NAME_MAPPING = {"fusing/instructpix2pix-1000-samples": ("input_image", "edit_prompt", "edited_image"), }
+
 
 def compute_text_embeddings(tokenizer, text_encoder, prompt):
     def encode_prompt(text_encoder,
@@ -92,7 +94,7 @@ def compute_text_embeddings(tokenizer, text_encoder, prompt):
         prompt_embeds = encode_prompt(
             text_encoder,
             text_inputs.input_ids,
-            text_inputs.attention_mask,)
+            text_inputs.attention_mask, )
     return prompt_embeds
 
 
@@ -141,19 +143,9 @@ def call_dataset(args, tokenizer, accelerator):
 
     def preprocess_train(examples):
         dataset_folder_name = str(args.dataset_name.split('/')[-1])
-        # base_dir = f'../../../data/diffusion/ClimateDiffusion/TrainData/dataconstruction/folder_train/{dataset_folder_name}'
-        base_dir = f'../../../data/diffusion/ClimateDiffusion/TrainData/dataconstruction/folder_train/{dataset_folder_name}'
-
         def preprocess_images(examples):
 
-            #original_images = np.concatenate(
-            #    [convert_to_np(Image.open(os.path.join(base_dir, image)), args.resolution) for image in
-            #     examples[original_image_column]])
             original_images = np.concatenate([convert_to_np(image, args.resolution) for image in examples[original_image_column]])
-            #edited_images = np.concatenate(
-            #    [convert_to_np(Image.open(os.path.join(base_dir, image)), args.resolution) for image in
-            #     examples[edited_image_column]])
-
             edited_images = np.concatenate([convert_to_np(image, args.resolution) for image in  examples[edited_image_column]])
 
             images = np.stack([original_images, edited_images])
@@ -209,10 +201,16 @@ def call_dataset(args, tokenizer, accelerator):
             depthmap_values.append(depthmap)
         input_ids = torch.stack([example["input_ids"] for example in examples])
         labels = []
+        neg_labels = []
         for example in examples:
             label = int(example["labels"]) + args.base_label_number
+            neg_label = int(example["labels"]) * -1 + args.base_label_number
+            if neg_label < 0 :
+                neg_label = 0
             labels.append(label)
+            neg_labels.append(neg_label)
         labels = torch.tensor(labels)
+        neg_labels = torch.tensor(neg_labels)
         if args.use_normalmap:
             normalmap_pixel_values = torch.stack([example['normal_map_pixel_values'] for example in examples])
         else:
@@ -222,6 +220,7 @@ def call_dataset(args, tokenizer, accelerator):
                 "depthmap_values": depthmap_values,
                 "input_ids": input_ids,
                 "labels": labels,
+                "neg_labels": neg_labels,
                 "normalmap_images": normalmap_pixel_values}
 
     train_dataloader = torch.utils.data.DataLoader(train_dataset, shuffle=True, collate_fn=collate_fn,
@@ -229,20 +228,19 @@ def call_dataset(args, tokenizer, accelerator):
                                                    num_workers=args.dataloader_num_workers, )
     return train_dataset, train_dataloader
 
-def change_unet_structure(unet):
+class CustomStructuredConv(nn.Module):
+    def __init__(self, in_channels, out_channels=1):
+        super().__init__()
+        self.structured_conv_in = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
 
-    class CustomStructuredConv(nn.Module):
-        def __init__(self, in_channels, out_channels=1):
-            super(CustomStructuredConv, self).__init__()  # ✅ 반드시 호출
-            conv_in_padding = (3 - 1) // 2
-            self.structured_conv_in = nn.Conv2d(in_channels,
-                                                out_channels,
-                                                kernel_size=3,
-                                                padding=conv_in_padding)
+    def forward(self, x):
+        return self.structured_conv_in(x)
 
-        def forward(self, x):
-            return self.structured_conv_in(x)
+def change_unet_structure(unet, args):
 
+    mask_processor = None  # 기본값 설정
+
+    # Rebuild UNet with modified config
     original_state_dict = unet.state_dict()
     config_dict = dict(unet.config)
     config_dict['class_embeddings_concat'] = True
@@ -251,46 +249,53 @@ def change_unet_structure(unet):
 
     unet = UNet2DConditionModel(**config_dict)
     empty_state_dict = unet.state_dict()
+
     for key in empty_state_dict:
         if key in original_state_dict:
-            empty_value = empty_state_dict[key]
-            origin_value = original_state_dict[key]
-            if empty_value.shape != origin_value.shape:
-                min_shape = tuple(min(e, o) for e, o in zip(empty_value.shape, origin_value.shape))
-                new_tensor = empty_value.clone()
-                slices = tuple(slice(0, s) for s in min_shape)
-                new_tensor[slices] = origin_value[slices]
-                empty_state_dict[key] = new_tensor
+            if empty_state_dict[key].shape == original_state_dict[key].shape:
+                empty_state_dict[key] = original_state_dict[key]
             else:
-                empty_state_dict[key] = origin_value
+                min_shape = tuple(min(e, o) for e, o in zip(empty_state_dict[key].shape, original_state_dict[key].shape))
+                slices = tuple(slice(0, s) for s in min_shape)
+                new_tensor = empty_state_dict[key].clone()
+                new_tensor[slices] = original_state_dict[key][slices]
+                empty_state_dict[key] = new_tensor
+
     unet.load_state_dict(empty_state_dict)
-    # [2] make scnet
+
+    # Determine in_channels
     in_channels = 8
-    scnet = None
-    mask_processor = VaeImageProcessor(vae_scale_factor=8,
-                                           do_normalize=False,
-                                           do_binarize=False,
-                                           do_resize=True,
+    if args.use_depthmap:
+        in_channels = 9
+        mask_processor = VaeImageProcessor(vae_scale_factor=8, do_normalize=False,
+                                           do_binarize=False, do_resize=True,
                                            do_convert_grayscale=True)
-    in_channels = 9
-        #if args.use_normalmap:
-    in_channels = 13
-            #if args.use_fused_conditionmap:
-    in_channels = 9
-    scnet = CustomStructuredConv(in_channels=5)
-    #else:
-    #    if args.use_normalmap: in_channels = 12
+        if args.use_normalmap:
+            in_channels = 13
+    elif args.use_normalmap:
+        in_channels = 12
+
+    scnet = None
+    if args.use_fused_conditionmap:
+        in_channels = 9
+        scnet = CustomStructuredConv(in_channels=5)
+
     out_channels = unet.conv_in.out_channels
     unet.register_to_config(in_channels=in_channels)
+
     with torch.no_grad():
-        new_conv_in = nn.Conv2d(in_channels, out_channels, unet.conv_in.kernel_size, unet.conv_in.stride,
-                                unet.conv_in.padding)
+        new_conv_in = nn.Conv2d(in_channels, out_channels,
+                                kernel_size=unet.conv_in.kernel_size,
+                                stride=unet.conv_in.stride,
+                                padding=unet.conv_in.padding)
         new_conv_in.weight.zero_()
         new_conv_in.weight[:, :8, :, :].copy_(unet.conv_in.weight)
         unet.conv_in = new_conv_in
-    unet.register_to_config(in_channels=in_channels)
-    print(f' in change unet, scnet = {scnet}')
+
+    print(f'in change_unet_structure → scnet: {scnet}')
     return unet, scnet, mask_processor
+
+
 
 def main(args):
 
@@ -313,7 +318,9 @@ def main(args):
                               log_with=args.report_to,
                               project_config=accelerator_project_config, )
     if accelerator.is_main_process:
-        wandb.init(project=args.wandb_project_name, name=args.wandb_name, )
+
+        wandb.init(project=args.wandb_project_name,
+                   name=args.wandb_name, )
 
     # Disable AMP for MPS.
     if torch.backends.mps.is_available():
@@ -342,44 +349,33 @@ def main(args):
 
     # Load scheduler, tokenizer and models.
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-    tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path,subfolder="tokenizer", revision=args.revision)
-    text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path,subfolder="text_encoder", revision=args.revision, variant=args.variant)
-    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path,subfolder="vae", revision=args.revision, variant=args.variant)
+    tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer",
+                                              revision=args.revision)
+    text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder",
+                                                 revision=args.revision, variant=args.variant)
+    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision,
+                                        variant=args.variant)
     print(f' (1.1) teacher unet')
-    teacher_unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision)
-    print(f' (1.2) student unet')
-    new_id = args.lora_fused_model_id
-    unet = UNet2DConditionModel.from_pretrained(
-        new_id,
-        subfolder="unet",
-        revision=args.non_ema_revision,
-        torch_dtype=torch.float16,  # 또는 float32, float16 상황에 맞게
-        low_cpu_mem_usage=False,  # ✅ meta tensor 방지
-        device_map=None  # ✅ 자동 분산 할당 방지 (원하지 않을 경우)
-    )
-
-    """
+    unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path,
+                                                subfolder="unet",
+                                                revision=args.non_ema_revision)
     print(f' (1.3) style teacher model')
-    sd_pipe = StableDiffusionPipeline.from_pretrained("sd-legacy/stable-diffusion-v1-5", torch_dtype=torch.float16)
+    sd_pipe = StableDiffusionPipeline.from_pretrained("sd-legacy/stable-diffusion-v1-5",
+                                                      torch_dtype=torch.float16)
     sd_pipe.load_lora_weights('/workspace/model/diffusion', weight_name="Reflections.safetensors", adapter_name='water_reflection_lora')
     sd_pipe.set_adapters(["water_reflection_lora"], adapter_weights=[1.0])
     sd_pipe.fuse_lora(adapter_names=["water_reflection_lora"], lora_scale=1.0)
     style_teacher_unet = sd_pipe.unet
     del sd_pipe
     style_teacher_unet.eval()
-    
+
     print(f' (1.3.2) key concept embedding')
-    key_concept = 'reflection'
-    key_concept_embedding = compute_text_embeddings(tokenizer, text_encoder, key_concept)
-    """
-    print(f' (1.1.2) teacher unet structure changed')
-    teacher_unet, teacher_scnet, mask_processor = change_unet_structure(teacher_unet)
+    unet, scnet, mask_processor = change_unet_structure(unet, args)
+    print(f' *** scnet = {scnet}')
+
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
-    # style_teacher_unet.requires_grad_(False)
 
-    print(f' (1.2.2) unet structure changed')
-    unet, scnet, mask_processor = change_unet_structure(unet)
 
     print(f' [student] scnet = {scnet}')
     print(f' [teacher] unet = {unet}')
@@ -403,32 +399,32 @@ def main(args):
 
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
         # 저장 대상만 등록: teacher_unet은 제외
-        model_name_dict = {
-            id(accelerator.unwrap_model(unet)): "unet",  # student_unet만 저장
-            id(accelerator.unwrap_model(scnet)): "structured_obj"
-        }
+        model_name_dict = {id(accelerator.unwrap_model(unet)): "unet",  # student_unet만 저장
+                           id(accelerator.unwrap_model(scnet)): "structured_obj"}
 
         def save_model_hook(models, weights, output_dir):
+
             if not accelerator.is_main_process:
                 return
 
             for i, model in enumerate(models):
+
                 unwrapped_model = accelerator.unwrap_model(model)
                 model_id = id(unwrapped_model)
 
                 model_name = model_name_dict.get(model_id, None)
+
+                print(f'*** model_name = {model_name}')
+
                 if model_name is None:
                     print(f"[Skip] Unknown or excluded model at index {i}")
                     continue
-
-                # Save UNet (student) to 'unet/' directory
                 if isinstance(unwrapped_model, UNet2DConditionModel) and model_name == "unet":
                     save_path = os.path.join(output_dir, "unet")
                     print(f"[Save Hook] Saving {model_name} to {save_path}")
                     unwrapped_model.save_pretrained(save_path)
 
-                # Save structured object (e.g., SCNet)
-                elif model_name == "structured_obj":
+                if model_name == "structured_obj" :
                     save_path = os.path.join(output_dir, "structured_obj.bin")
                     print(f"[Save Hook] Saving {model_name} to {save_path}")
                     torch.save(unwrapped_model.state_dict(), save_path)
@@ -436,21 +432,38 @@ def main(args):
                 if weights:
                     weights.pop()
 
+
+        def load_model_hook(models, input_dir):
+
+            for i in range(len(models)):
+
+                model = models.pop()
+                #unwrapped_model = accelerator.unwrap_model(model)
+                model_id = id(model)
+                model_name = model_name_dict.get(model_id, None)
+                print(f'loading,model_name = {model_name}')
+                if model_name is None:
+                    print(f"[Skip] Unknown or excluded model at index {i}")
+                    continue
+                # Load UNet from 'unet/' directory
+                if isinstance(model, UNet2DConditionModel) and model_name == "unet":
+                    load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
+                    model.register_to_config(**load_model.config)
+                    model.load_state_dict(load_model.state_dict())
+                # Load structured object (e.g., SCNet)
+                elif model_name == "structured_obj":
+                    load_path = os.path.join(input_dir, "structured_obj.bin")
+                    print(f"[Load Hook] Loading {model_name} from {load_path}")
+                    state_dict = torch.load(load_path, map_location="cpu")
+                    model.load_state_dict(state_dict)
         accelerator.register_save_state_pre_hook(save_model_hook)
+        accelerator.register_load_state_pre_hook(load_model_hook)
 
     print(f' step 2. call dataset')
     train_dataset, train_dataloader = call_dataset(args, tokenizer, accelerator)
-
-
-    #style_image_folder = f'../../../data/diffusion/ClimateDiffusion/TrainData/dataconstruction/folder_train/style_folder/{key_concept}/rgb'
-    #images = os.listdir(style_image_folder)
-    #print(f' step 6. style {len(images)} images')
-    #style_dataset, style_dataloader = build_style_dataloader(style_image_folder, batch_size=args.train_batch_size,
-    #                                                         resolution=args.resolution, center_crop=True, num_workers=4)
-
     print(f' step 7. optimizer')
     if args.use_8bit_adam:
-        try:
+        try :
             import bitsandbytes as bnb
         except ImportError:
             raise ImportError(
@@ -458,31 +471,28 @@ def main(args):
         optimizer_cls = bnb.optim.AdamW8bit
     else:
         optimizer_cls = torch.optim.AdamW
-    optimizer1 = optimizer_cls(list(unet.parameters()) + list(scnet.parameters()),
-                                  lr=args.learning_rate, betas=(args.adam_beta1, args.adam_beta2),
-                                  weight_decay=args.adam_weight_decay, eps=args.adam_epsilon)
-    optimizer2 = optimizer_cls(list(teacher_unet.parameters()) + list(teacher_scnet.parameters()),
-                               lr=args.learning_rate, betas=(args.adam_beta1, args.adam_beta2),
+
+    if scnet is not None :
+        trainable_param = list(unet.parameters()) + list(scnet.parameters())
+    else :
+        trainable_param = list(unet.parameters())
+
+    optimizer1 = optimizer_cls(trainable_param, lr=args.learning_rate, betas=(args.adam_beta1, args.adam_beta2),
                                weight_decay=args.adam_weight_decay, eps=args.adam_epsilon)
     num_warmup_steps_for_scheduler = args.lr_warmup_steps * accelerator.num_processes
     if args.max_train_steps is None:
         len_train_dataloader_after_sharding = math.ceil(len(train_dataloader) / accelerator.num_processes)
         num_update_steps_per_epoch = math.ceil(len_train_dataloader_after_sharding / args.gradient_accumulation_steps)
-        num_training_steps_for_scheduler = (args.num_train_epochs * num_update_steps_per_epoch * accelerator.num_processes)
+        num_training_steps_for_scheduler = (
+                    args.num_train_epochs * num_update_steps_per_epoch * accelerator.num_processes)
     else:
         num_training_steps_for_scheduler = args.max_train_steps * accelerator.num_processes
-    lr_scheduler1 = get_scheduler(args.lr_scheduler,optimizer=optimizer1,
-                                  num_warmup_steps=num_warmup_steps_for_scheduler,num_training_steps=num_training_steps_for_scheduler,)
-    lr_scheduler2 = get_scheduler(args.lr_scheduler,optimizer=optimizer2,
-                                  num_warmup_steps=num_warmup_steps_for_scheduler,num_training_steps=num_training_steps_for_scheduler,)
+    lr_scheduler1 = get_scheduler(args.lr_scheduler, optimizer=optimizer1,
+                                  num_warmup_steps=num_warmup_steps_for_scheduler,
+                                  num_training_steps=num_training_steps_for_scheduler, )
 
     print(f' step 8. prepare')
-    #(unet, scnet,optimizer1, optimizer2,train_dataloader, style_dataloader,
-     #lr_scheduler1, lr_scheduler2,teacher_unet, teacher_scnet) = accelerator.prepare(unet, scnet,optimizer1, optimizer2,train_dataloader, style_dataloader,
-     #                                                                                lr_scheduler1, lr_scheduler2,teacher_unet, teacher_scnet)
-    (unet, scnet,optimizer1, optimizer2,train_dataloader,
-     lr_scheduler1, lr_scheduler2,teacher_unet, teacher_scnet) = accelerator.prepare(unet, scnet,optimizer1, optimizer2,train_dataloader,
-                                                                                     lr_scheduler1, lr_scheduler2,teacher_unet, teacher_scnet)
+    (unet, scnet, optimizer1,train_dataloader,lr_scheduler1) = accelerator.prepare(unet, scnet, optimizer1, train_dataloader,lr_scheduler1,)
     if args.use_ema:
         ema_unet.to(accelerator.device)
 
@@ -495,8 +505,6 @@ def main(args):
     # Move text_encode and vae to gpu and cast to weight_dtype
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
-    #style_teacher_unet.to(accelerator.device, dtype=weight_dtype)
-    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
@@ -508,9 +516,6 @@ def main(args):
             )
     # Afterwards we recalculate our number of training epochs
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-
-    # We need to initialize the trackers we use, and also store our configuration.
-    # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
         accelerator.init_trackers("instruct-pix2pix", config=vars(args))
 
@@ -543,6 +548,7 @@ def main(args):
                 f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
             )
             args.resume_from_checkpoint = None
+
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
             # here problem ...
@@ -551,6 +557,8 @@ def main(args):
             resume_global_step = global_step * args.gradient_accumulation_steps
             first_epoch = global_step // num_update_steps_per_epoch
             resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
+
+
         print(f' Start Global Step : {global_step}')
 
     # Only show the progress bar once on each machine.
@@ -561,155 +569,86 @@ def main(args):
 
         unet.train()
         train_loss = 0.0
+
         for step, batch in enumerate(train_dataloader):
-            #style_iter = iter(style_dataloader)
-            #style_batch = next(style_iter)
+            with accelerator.accumulate(unet):
 
-            if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
-                if step % args.gradient_accumulation_steps == 0:
-                    progress_bar.update(1)
-                continue
+                total_loss = 0.0
+                for direction in ["normal", "reverse"]:
 
-            with (accelerator.accumulate(unet)):
-                class_labels = batch["labels"].to(device=accelerator.device)
-                style_class_labels = class_labels * 0
+                    if direction == "normal":
+                        source_pixels = batch["edited_pixel_values"]
+                        target_pixels = batch["original_pixel_values"]
+                        class_labels = batch["labels"].to(device=accelerator.device)
 
-                # [1] target
-                latents       = vae.encode(      batch["edited_pixel_values"].to(weight_dtype)).latent_dist.sample() * vae.config.scaling_factor
-                #style_latents = vae.encode(style_batch["original_pixel_values"].to(weight_dtype)).latent_dist.mode() * vae.config.scaling_factor
-                bsz = latents.shape[0]
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-                timesteps = timesteps.long()
-                noise = torch.randn_like(latents)
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-                #noisy_style_latents = noise_scheduler.add_noise(style_latents, noise, timesteps)
-
-                # --------------------------------------------------------------------------------------------------------
-                # [2.2] text condition
-                # --------------------------------------------------------------------------------------------------------
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
-                #style_hidden_states = key_concept_embedding.repeat(bsz, 1, 1).to(device=accelerator.device,
-                #                                                                 dtype=weight_dtype)
-
-                # --------------------------------------------------------------------------------------------------------
-                # [2.1] image condition
-                # --------------------------------------------------------------------------------------------------------
-                original_image_embeds = vae.encode(batch["original_pixel_values"].to(weight_dtype)).latent_dist.mode()
-                #original_style_image_embeds = vae.encode(style_batch["original_pixel_values"].to(weight_dtype)).latent_dist.mode()
-                if args.conditioning_dropout_prob is not None:
-                    random_p = torch.rand(bsz, device=latents.device, generator=generator)
-                    prompt_mask = random_p < 2 * args.conditioning_dropout_prob
-                    prompt_mask = prompt_mask.reshape(bsz, 1, 1)
-                    null_conditioning = text_encoder(tokenize_captions([""], tokenizer).to(accelerator.device))[0]
-                    encoder_hidden_states = torch.where(prompt_mask, null_conditioning, encoder_hidden_states)
-                    image_mask_dtype = original_image_embeds.dtype
-                    image_mask = 1 - ((random_p >= args.conditioning_dropout_prob).to(image_mask_dtype)
-                                      * (random_p < 3 * args.conditioning_dropout_prob).to(image_mask_dtype))
-                    image_mask = image_mask.reshape(bsz, 1, 1, 1)
-                    original_image_embeds = image_mask * original_image_embeds
-                    # original_style_image_embeds = image_mask * original_style_image_embeds
-
-
-                structured_latents = None
-                style_structured_latents = None
-                if args.use_depthmap:
-                    def prepare_depth_latents(depth_condition, height, width, dtype, device,
-                                              do_classifier_free_guidance):
-                        vae_scale_factor = 8
-                        depth_latent = torch.nn.functional.interpolate(depth_condition,
-                                                                       size=(height // vae_scale_factor,
-                                                                             width // vae_scale_factor))
-                        depth_latent = depth_latent.to(device=device, dtype=dtype)
-                        depth_latent = torch.cat([depth_latent] * 2) if do_classifier_free_guidance else depth_latent
-                        return depth_latent
-
-                    # [1]
-                    depth_condition = mask_processor.preprocess(batch["depthmap_values"],height=args.resolution,width=args.resolution,resize_mode='default')
-                    depth_latent = prepare_depth_latents(depth_condition,args.resolution,args.resolution,weight_dtype,accelerator.device,False)  # Batch, 1, 64,64
-                    structured_latents = depth_latent
-                    # [2.2]
-                    #style_depth_condition = mask_processor.preprocess(style_batch["depthmap_values"],height=args.resolution,width=args.resolution,resize_mode='default')
-                    #style_depth_latent = prepare_depth_latents(style_depth_condition,args.resolution,args.resolution,weight_dtype,accelerator.device,False)
-                    # style_structured_latents = style_depth_latent
-
-                if args.use_normalmap:
-                    normal_map_latent = vae.encode(batch["normalmap_images"].to(weight_dtype)).latent_dist.mode()
-                    #style_normalmap_latent = vae.encode(style_batch["normalmap_images"].to(weight_dtype)).latent_dist.mode()
-                    if structured_latents is not None:
-                        structured_latents = torch.cat([structured_latents, normal_map_latent], dim=1)
-                        #style_structured_latents = torch.cat([style_structured_latents, style_normalmap_latent], dim=1)
                     else:
-                        structured_latents = normal_map_latent
-                        #style_structured_latents = style_normalmap_latent
+                        source_pixels = batch["original_pixel_values"]
+                        target_pixels = batch["edited_pixel_values"]
+                        class_labels = batch["neg_labels"].to(device=accelerator.device)
 
-                if structured_latents is not None:
-                    if args.use_fused_conditionmap:
-                        student_structured_latents = scnet(structured_latents)
-                        teacher_structured_latents = teacher_scnet(structured_latents)
-                        #style_structured_latents = scnet(style_structured_latents)
+                    # Step 1: latent encoding
+                    latents = vae.encode(source_pixels.to(weight_dtype)).latent_dist.sample() * vae.config.scaling_factor
+                    target_latents = vae.encode(target_pixels.to(weight_dtype)).latent_dist.mode()
 
-                    # [2] level matching
-                    teacher_original_image_embeds = torch.cat([original_image_embeds, teacher_structured_latents],dim=1)
-                    original_image_embeds = torch.cat([original_image_embeds, student_structured_latents], dim=1)
-                    # [2] style matching
-                    #original_style_image_embeds = torch.cat([original_style_image_embeds, style_structured_latents], dim=1)
+                    bsz = latents.shape[0]
+                    timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,),
+                                              device=latents.device)
+                    timesteps = timesteps.long()
 
-                # --------------------------------------------------------------------------------------------------------
-                # [2.3] final
-                # --------------------------------------------------------------------------------------------------------
-                teacher_concatenated_noisy_latents = torch.cat([noisy_latents, teacher_original_image_embeds], dim=1)
-                concatenated_noisy_latents = torch.cat([noisy_latents, original_image_embeds], dim=1)
-                #concatenated_style_latents = torch.cat([noisy_style_latents, original_style_image_embeds], dim=1)
+                    noise = torch.randn_like(latents)
+                    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-                image_embeds = None
-                added_cond_kwargs = {"image_embeds": image_embeds} if image_embeds is not None else None
-                model_pred = unet(concatenated_noisy_latents,
-                                  timesteps,
-                                  encoder_hidden_states,
-                                  added_cond_kwargs=added_cond_kwargs,
-                                  class_labels=class_labels,  # class labels
-                                  return_dict=False, )[0]
-                teacher_model_pred = teacher_unet(teacher_concatenated_noisy_latents,
-                                                  timesteps,
-                                                  encoder_hidden_states,
-                                                  added_cond_kwargs=added_cond_kwargs,
-                                                  class_labels=class_labels,  # class labels
-                                                  return_dict=False, )[0]
-                student_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                teacher_loss = F.mse_loss(teacher_model_pred.float(), target.float(), reduction="mean")
-                distill_loss = F.mse_loss(model_pred.float(), teacher_model_pred.float(), reduction="mean")
-                """
-                with torch.no_grad():
-                    style_model_pred = style_teacher_unet(noisy_style_latents,
-                                                          timesteps,
-                                                          encoder_hidden_states)[0]
-                style_student_pred = unet(concatenated_style_latents,
-                                          timesteps,
-                                          style_hidden_states,
-                                          class_labels=style_class_labels,
-                                          return_dict=False, )[0]
-                style_distill_loss = F.mse_loss(style_student_pred.float(),
-                                                style_model_pred.float(), reduction="mean")
+                    # Step 2: condition encoding
+                    encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                    image_embeds = target_latents
 
-                """
-                total_loss = student_loss + teacher_loss + distill_loss  # + args.style_loss_lambda * style_distill_loss
-                avg_loss = accelerator.gather(total_loss.repeat(args.train_batch_size)).mean()
-                train_loss += avg_loss.item() / args.gradient_accumulation_steps
+                    # Step 3: structured condition 추가
+                    structured_latents = None
+                    if args.use_depthmap:
+                        depth_condition = mask_processor.preprocess(batch["depthmap_values"], height=args.resolution,
+                                                                    width=args.resolution, resize_mode='default')
+                        depth_latent = torch.nn.functional.interpolate(depth_condition,
+                                                                       size=(
+                                                                       args.resolution // 8, args.resolution // 8)).to(
+                            device=accelerator.device, dtype=weight_dtype)
+                        structured_latents = depth_latent
+                    if args.use_normalmap:
+                        normal_map_latent = vae.encode(batch["normalmap_images"].to(weight_dtype)).latent_dist.mode()
+                        structured_latents = torch.cat([structured_latents, normal_map_latent],
+                                                       dim=1) if structured_latents is not None else normal_map_latent
+                    if structured_latents is not None and args.use_fused_conditionmap:
+                        structured_latents = scnet(structured_latents)
+
+                    if structured_latents is not None:
+                        image_embeds = torch.cat([image_embeds, structured_latents], dim=1)
+
+                    # Step 4: UNet prediction
+                    input_latents = torch.cat([noisy_latents, image_embeds], dim=1)
+
+                    model_pred = unet(
+                        input_latents,
+                        timesteps,
+                        encoder_hidden_states,
+                        class_labels=class_labels,
+                        return_dict=False,
+                    )[0]
+
+                    # Step 5: compute loss
+                    if noise_scheduler.config.prediction_type == "epsilon":
+                        target = noise
+                    elif noise_scheduler.config.prediction_type == "v_prediction":
+                        target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                    else:
+                        raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                    total_loss += loss
+
+                # Step 6: Backward
                 accelerator.backward(total_loss)
-                # Student UNet
                 optimizer1.step()
                 lr_scheduler1.step()
                 optimizer1.zero_grad()
-                # Teacher UNet
-                optimizer2.step()
-                lr_scheduler2.step()
-                optimizer2.zero_grad()
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 if args.use_ema:
@@ -719,8 +658,8 @@ def main(args):
 
                 # logging
                 if accelerator.is_main_process:
-                    wandb.log({"train_loss": train_loss, "student_loss": student_loss, "teacher_loss": teacher_loss,
-                               "distill_loss": distill_loss}, step=global_step)
+                    wandb.log({"train_loss": total_loss,},
+                              step=global_step)
                 train_loss = 0.0
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
@@ -742,9 +681,7 @@ def main(args):
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
-            logs = {"train_loss": train_loss, "student_loss": student_loss.detach().item(),
-                    "teacher_loss": teacher_loss.detach().item(), "distill_loss": distill_loss.detach().item(),
-                    "lr": lr_scheduler1.get_last_lr()[0]}
+            logs = {"train_loss": total_loss.detach().item(), "lr": lr_scheduler1.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
             if global_step >= args.max_train_steps:
                 break
@@ -868,7 +805,11 @@ if __name__ == "__main__":
     parser.add_argument("--num_levels", type=int)
     parser.add_argument("--style_loss_lambda", type=float, default=0.1)
 
-
+    parser.add_argument("--test_02", action="store_true", help="Run test case 02 (label: 0 if label==0 else 1)")
+    parser.add_argument("--test_03", action="store_true", help="Run test case 03 (label: 0 if label==0 else 1)")
+    parser.add_argument("--test_12", action="store_true", help="Run test case 12 (label: 0 if label==1 else 1)")
+    parser.add_argument("--test_13", action="store_true", help="Run test case 13 (label: 0 if label==1 else 1)")
+    parser.add_argument("--test_23", action="store_true", help="Run test case 13 (label: 0 if label==1 else 1)")
     args = parser.parse_args()
 
     # Sync local rank with env if needed
