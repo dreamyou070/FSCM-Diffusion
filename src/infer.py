@@ -131,7 +131,7 @@ def main(args) :
                             if not args.use_normalmap :
                                 normal_map_latent = None
 
-                            start_timesteps = [200,300,400,500,700,900]
+                            start_timesteps = [500,700,900]
                             for start_timestep in start_timesteps :
                                 generator = torch.Generator("cuda").manual_seed(args.seed)
                                 edited_image = pipe(prompt = prompt,                     # 1) concept key word

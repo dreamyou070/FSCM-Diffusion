@@ -1,18 +1,18 @@
 # 백그라운드 실행 예시:
-# nohup bash train_reverse.sh > ./logs/train_flood_2_neg_cond_0.5.log 2>&1 &
+# nohup bash train_reverse_normal_reverse.sh > ./logs/train_flood_1_neg_cond_0.5.log 2>&1 &
 export MODEL_NAME="timbrooks/instruct-pix2pix"
 export ACCELERATE_FIND_UNUSED_PARAMETERS=true
-export main_process_port=50202
-config_file="acc_3.yaml"
+export main_process_port=51205
+config_file="acc_1.yaml"
 disaster="flood"
 export DATASET_ID="ParkSY/FSCM_Flood"
-file_name="2_labeling_depthmap_minus_class_reverse"
+file_name="1_only_labeling_unconditional_prob_0.5_minus_class_reverse"
 
 accelerate launch \
   --config_file ../accelerate_config/$config_file \
   --main_process_port $main_process_port \
   --mixed_precision="fp16" \
-  train_reverse_normal_reserse.py \
+  train_reverse_normal_reverse.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --dataset_name=$DATASET_ID \
   --base_label_number 4 \
@@ -27,10 +27,9 @@ accelerate launch \
   --lr_warmup_steps=0 \
   --max_grad_norm=1 \
   --wandb_project_name="cctv_project" \
-  --wandb_name="labeling_depthmap_minus_class_prob_0.05_reverse" \
+  --wandb_name="labeling_unconditional_prob_0.5_minus_class_reverse" \
   --output_dir="../result/$disaster/$file_name" \
   --checkpointing_steps=50 \
   --checkpoints_total_limit=50 \
   --seed 42 \
-  --conditioning_dropout_prob=0.05 \
-  --use_depthmap
+  --conditioning_dropout_prob=0.05

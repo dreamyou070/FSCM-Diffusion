@@ -212,7 +212,7 @@ def call_dataset(args, tokenizer, accelerator):
         input_ids = torch.stack([example["input_ids"] for example in examples])
         labels = []
         for example in examples:
-            #label = int(example["labels"]) + args.base_label_number
+            label = int(example["labels"]) + args.base_label_number
             if args.test_02 :
                 if int(example["labels"]) == 0: label = 0
                 else : label = 1
@@ -232,8 +232,6 @@ def call_dataset(args, tokenizer, accelerator):
             if args.test_23 :
                 if int(example["labels"]) == 2: label = 0
                 else : label = 1
-
-
             labels.append(label)
         labels = torch.tensor(labels)
         if args.use_normalmap:
@@ -316,9 +314,59 @@ def change_unet_structure(unet, args):
         new_conv_in.weight[:, :8, :, :].copy_(unet.conv_in.weight)
         unet.conv_in = new_conv_in
 
+    if args.train_key_concept :
+        #unet.config['cross_attention_dim'] = 768 * 2
+        new_dim = 768 * 2
+        from diffusers.models.attention_processor import Attention, AttnProcessor2_0
+
+        def modify_cross_attention_with_keyvector(unet, new_cross_attention_dim=768 * 2):
+
+            for name, module in unet.named_modules():
+
+                if isinstance(module, nn.Module) and hasattr(module, 'set_processor'):
+
+                    if 'attn2' not in name:
+                        continue
+
+                    old_processor = module.get_processor()
+
+                    if not isinstance(old_processor, AttnProcessor2_0):
+                        continue
+
+                    print(f"[MODIFY] {name}: cross_attention_dim {module.cross_attention_dim} → {new_cross_attention_dim}")
+
+                    org_to_k = module.to_k
+                    org_to_v = module.to_v
+
+                    # 기존 파라미터 추출
+                    org_to_k_weight = org_to_k.weight.data
+                    org_to_k_bias = org_to_k.bias.data if org_to_k.bias is not None else None
+
+                    org_to_v_weight = org_to_v.weight.data
+                    org_to_v_bias = org_to_v.bias.data if org_to_v.bias is not None else None
+
+                    # 새로운 cross_attention_dim에 맞게 Linear 레이어 생성
+                    module.to_k = nn.Linear(new_cross_attention_dim, module.inner_kv_dim,
+                                            bias=org_to_k.bias is not None).to(org_to_k.weight.device)
+                    module.to_v = nn.Linear(new_cross_attention_dim, module.inner_kv_dim,
+                                            bias=org_to_v.bias is not None).to(org_to_v.weight.device)
+
+                    # 기존 weight를 앞부분에 복사 (추가된 차원은 초기화된 채 유지)
+                    with torch.no_grad():
+                        module.to_k.weight[:, :org_to_k_weight.shape[1]] = org_to_k_weight
+                        module.to_v.weight[:, :org_to_v_weight.shape[1]] = org_to_v_weight
+
+                        if org_to_k_bias is not None:
+                            module.to_k.bias.copy_(org_to_k_bias)
+                        if org_to_v_bias is not None:
+                            module.to_v.bias.copy_(org_to_v_bias)
+
+
+
+        modify_cross_attention_with_keyvector(unet, new_dim)
+
     print(f'in change_unet_structure → scnet: {scnet}')
     return unet, scnet, mask_processor
-
 
 
 def main(args):
@@ -399,8 +447,6 @@ def main(args):
 
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
-
-
     print(f' [student] scnet = {scnet}')
     print(f' [teacher] unet = {unet}')
     if args.use_ema:
@@ -515,6 +561,11 @@ def main(args):
                                   num_warmup_steps=num_warmup_steps_for_scheduler,
                                   num_training_steps=num_training_steps_for_scheduler, )
 
+    key_concept = "more"
+    key_vector = text_encoder(tokenize_captions([key_concept], tokenizer))[0]
+
+
+
     print(f' step 8. prepare')
     (unet, scnet, optimizer1,train_dataloader,lr_scheduler1) = accelerator.prepare(unet, scnet, optimizer1, train_dataloader,lr_scheduler1,)
     if args.use_ema:
@@ -602,10 +653,13 @@ def main(args):
 
             with (accelerator.accumulate(unet)):
                 class_labels = batch["labels"].to(device=accelerator.device)
-
+                # key_vector
+                # [B, 1, 1] shape으로 broadcast용 scale factor 만들기
+                scale_factors = class_labels.view(-1, 1, 1)
+                # key_vector broadcast → [B, 77, 768]
+                key_vectors = key_vector.to(device=accelerator.device, dtype = weight_dtype) * scale_factors  # [B, 77, 768]
                 # [1] target
-                latents = vae.encode(
-                    batch["edited_pixel_values"].to(weight_dtype)).latent_dist.sample() * vae.config.scaling_factor
+                latents = vae.encode(batch["edited_pixel_values"].to(weight_dtype)).latent_dist.sample() * vae.config.scaling_factor
                 # style_latents = vae.encode(style_batch["original_pixel_values"].to(weight_dtype)).latent_dist.mode() * vae.config.scaling_factor
                 bsz = latents.shape[0]
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
@@ -613,6 +667,9 @@ def main(args):
                 noise = torch.randn_like(latents)
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
                 encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                if args.train_key_concept :
+                    encoder_hidden_states = torch.cat((encoder_hidden_states, key_vectors), dim=-1)
+                #print(f'after concat, encoder_hidden_states = {encoder_hidden_states.shape}')
                 # --------------------------------------------------------------------------------------------------------
                 # [2.1] image condition
                 # --------------------------------------------------------------------------------------------------------
@@ -623,6 +680,9 @@ def main(args):
                     prompt_mask = prompt_mask.reshape(bsz, 1, 1)
 
                     null_conditioning = text_encoder(tokenize_captions([""], tokenizer).to(accelerator.device))[0]
+                    if args.train_key_concept :
+                        null_conditioning = torch.cat((null_conditioning, null_conditioning), dim=-1)
+
                     encoder_hidden_states = torch.where(prompt_mask,
                                                         null_conditioning,
                                                         encoder_hidden_states) # level 하고 같이 가도 좋을듯
@@ -633,6 +693,7 @@ def main(args):
                     original_image_embeds = image_mask * original_image_embeds
 
                 structured_latents = None
+
                 if args.use_depthmap:
                     def prepare_depth_latents(depth_condition, height, width, dtype, device,
                                               do_classifier_free_guidance):
@@ -849,6 +910,8 @@ if __name__ == "__main__":
     parser.add_argument("--test_12", action="store_true", help="Run test case 12 (label: 0 if label==1 else 1)")
     parser.add_argument("--test_13", action="store_true", help="Run test case 13 (label: 0 if label==1 else 1)")
     parser.add_argument("--test_23", action="store_true", help="Run test case 13 (label: 0 if label==1 else 1)")
+    parser.add_argument("--train_key_concept", action="store_true")
+
     args = parser.parse_args()
 
     # Sync local rank with env if needed
