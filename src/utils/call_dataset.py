@@ -44,11 +44,12 @@ def load_dataloader(args, tokenizer, accelerator):
     # --------------------------------------------
     # 3. Text Tokenizer
     # --------------------------------------------
-    def tokenize_captions(captions):
+    def tokenize_captions(captions, padding_method = "max_length"):
+
         return tokenizer(
             captions,
             max_length=tokenizer.model_max_length,
-            padding="max_length",
+            padding=padding_method,
             truncation=True,
             return_tensors="pt"
         ).input_ids
@@ -134,6 +135,11 @@ def load_dataloader(args, tokenizer, accelerator):
 
     return train_dataset, train_dataloader
 
-def tokenize_captions(captions, tokenizer):
-    inputs = tokenizer(captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt")
+def tokenize_captions(captions, tokenizer,
+                      padding_method = 'max_length',):
+    inputs = tokenizer(captions,
+                       max_length=tokenizer.model_max_length,
+                       padding=padding_method,
+                       truncation=True,
+                       return_tensors="pt")
     return inputs.input_ids

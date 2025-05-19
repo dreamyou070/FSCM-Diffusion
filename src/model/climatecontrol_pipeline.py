@@ -156,6 +156,7 @@ class ClimateControlPipeline(
     def __call__(
         self,
         prompt: Union[str, List[str]] = None,
+        key_concept: Union[str, List[str]] = None,
         image: PipelineImageInput = None,
         depth_image: Optional = None, ##########################################################
         normal_map_latent: Optional = None,
@@ -245,6 +246,7 @@ class ClimateControlPipeline(
         device = self._execution_device
 
         # 2. Encode input prompt
+        print(f' input to the _encode_prompt function, prompt = {prompt}')
         prompt_embeds = self._encode_prompt(prompt,
                                             device,
                                             num_images_per_prompt,
@@ -252,7 +254,22 @@ class ClimateControlPipeline(
                                             negative_prompt,
                                             prompt_embeds=prompt_embeds,
                                             negative_prompt_embeds=negative_prompt_embeds,
-                                            reverse = reverse)
+                                            reverse = reverse,
+                                            class_labels=None)
+        if key_concept is not None :
+            if type(key_concept) == str :
+                key_concept = [key_concept]
+            key_concept_embeds = self._encode_prompt(key_concept,
+                                                     device,
+                                                     num_images_per_prompt,
+                                                     self.do_classifier_free_guidance, negative_prompt,
+                                                     prompt_embeds=None,
+                                                     negative_prompt_embeds=None,
+                                                     reverse = reverse,
+                                                     class_labels = class_labels)
+            prompt_embeds = torch.cat([prompt_embeds, key_concept_embeds], dim=-1)
+
+
         dtype = prompt_embeds.dtype
 
         if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
@@ -439,8 +456,7 @@ class ClimateControlPipeline(
 
         return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
 
-    def _encode_prompt(
-        self,
+    def _encode_prompt(self,
         prompt,
         device,
         num_images_per_prompt,
@@ -448,7 +464,7 @@ class ClimateControlPipeline(
         negative_prompt=None,
         prompt_embeds: Optional[torch.Tensor] = None,
         negative_prompt_embeds: Optional[torch.Tensor] = None,
-            reverse = False,
+            reverse = False,class_labels = False
     ):
 
         if prompt is not None and isinstance(prompt, str):
@@ -489,6 +505,7 @@ class ClimateControlPipeline(
 
             prompt_embeds = self.text_encoder(text_input_ids.to(device), attention_mask=attention_mask)
             prompt_embeds = prompt_embeds[0]
+
 
         if self.text_encoder is not None:
             prompt_embeds_dtype = self.text_encoder.dtype
@@ -560,8 +577,14 @@ class ClimateControlPipeline(
             # Here we concatenate the unconditional and text embeddings into a single batch
             # to avoid doing two forward passes
             # pix2pix has two negative embeddings, and unlike in other pipelines latents are ordered [prompt_embeds, negative_prompt_embeds, negative_prompt_embeds]
+            print(f'before multiply, prompt_embeds = {prompt_embeds.shape}')
+            print(f'after  multiply, prompt_embeds = {prompt_embeds.shape}')
+            # [1,77,7698]
+            # class_label = torch.tensor([3]
+            # how to multiply?
+            if class_labels is not None:
+                prompt_embeds = prompt_embeds * class_labels #
             prompt_embeds = torch.cat([prompt_embeds, negative_prompt_embeds, negative_prompt_embeds])
-
         return prompt_embeds
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.encode_image

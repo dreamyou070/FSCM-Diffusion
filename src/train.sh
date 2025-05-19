@@ -5,11 +5,11 @@
 export MODEL_NAME="timbrooks/instruct-pix2pix"
 export ACCELERATE_FIND_UNUSED_PARAMETERS=true
 
-export main_process_port=53223
-config_file="acc_1.yaml"
+export main_process_port=53333
+config_file="acc_0.yaml"
 disaster="flood"
 export DATASET_ID="ParkSY/FSCM_Flood"
-file_name="1_only_labeling_with_direction"
+file_name="1_only_labeling_with_direction_concept_sentencelen_concat"
 
 accelerate launch \
   --config_file ../accelerate_config/$config_file \
@@ -30,15 +30,14 @@ accelerate launch \
   --lr_warmup_steps=0 \
   --max_grad_norm=1 \
   --wandb_project_name="cctv_project" \
-  --wandb_name="only_labeling_with_direction" \
+  --wandb_name="only_labeling_with_direction_concept_sentencelen_concat" \
   --output_dir="../result/$disaster/$file_name" \
   --checkpointing_steps=50 \
   --checkpoints_total_limit=50 \
   --seed 42 \
-  --conditioning_dropout_prob=0.05 --train_key_concept
+  --conditioning_dropout_prob=0.05 --train_key_concept --concept_alpha 0.5
 
-# --use_normalmap \
-                  #  --use_normalmap --use_depthmap
+# --use_normalmap #  --use_normalmap --use_depthmap
 # --conditioning_dropout_prob=0.05  --use_normalmap --use_fused_conditionmap --use_lora
 # --use_depthmap --use_normalmap \
 # --use_normalmap \

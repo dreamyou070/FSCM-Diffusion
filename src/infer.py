@@ -40,6 +40,11 @@ def main(args) :
         unet.eval()
         pipe.unet = unet
 
+        key_concept = ""
+        if args.train_key_concept :
+            key_concept = "more"
+
+
         if args.use_fused_conditionmap :
             if args.test_image_condition :
                 print(f' making structure_obj!')
@@ -135,6 +140,7 @@ def main(args) :
                             for start_timestep in start_timesteps :
                                 generator = torch.Generator("cuda").manual_seed(args.seed)
                                 edited_image = pipe(prompt = prompt,                     # 1) concept key word
+                                                    key_concept=[key_concept],
                                                     image = original_image,                # 2) start image
                                                     class_labels=class_labels,           # 3) label (long tensor)
                                                     neg_class_label = neg_class_label,
@@ -206,6 +212,7 @@ if __name__ == '__main__':
     parser.add_argument("--do_third_negative_label_guidance", action='store_true')  # test_second
     parser.add_argument("--test_second", action='store_true')  #
     parser.add_argument("--minus_class", action='store_true')  #
-    parser.add_argument("--reverse", action='store_true')  #
+    parser.add_argument("--reverse", action='store_true')  # train_key_concept
+    parser.add_argument("--train_key_concept", action='store_true')  #
     args = parser.parse_args()
     main(args)

@@ -315,55 +315,57 @@ def change_unet_structure(unet, args):
         unet.conv_in = new_conv_in
 
     if args.train_key_concept :
-        #unet.config['cross_attention_dim'] = 768 * 2
-        new_dim = 768 * 2
-        from diffusers.models.attention_processor import Attention, AttnProcessor2_0
 
-        def modify_cross_attention_with_keyvector(unet, new_cross_attention_dim=768 * 2):
+        if args.dimension_concat :
 
-            for name, module in unet.named_modules():
+            new_dim = 768 * 2
+            unet.config['cross_attention_dim'] = 768 * 2
 
-                if isinstance(module, nn.Module) and hasattr(module, 'set_processor'):
+            from diffusers.models.attention_processor import Attention, AttnProcessor2_0
 
-                    if 'attn2' not in name:
-                        continue
+            def modify_cross_attention_with_keyvector(unet, new_cross_attention_dim=768 * 2):
 
-                    old_processor = module.get_processor()
+                for name, module in unet.named_modules():
 
-                    if not isinstance(old_processor, AttnProcessor2_0):
-                        continue
+                    if isinstance(module, nn.Module) and hasattr(module, 'set_processor'):
 
-                    print(f"[MODIFY] {name}: cross_attention_dim {module.cross_attention_dim} → {new_cross_attention_dim}")
+                        if 'attn2' not in name:
+                            continue
 
-                    org_to_k = module.to_k
-                    org_to_v = module.to_v
+                        old_processor = module.get_processor()
 
-                    # 기존 파라미터 추출
-                    org_to_k_weight = org_to_k.weight.data
-                    org_to_k_bias = org_to_k.bias.data if org_to_k.bias is not None else None
+                        if not isinstance(old_processor, AttnProcessor2_0):
+                            continue
 
-                    org_to_v_weight = org_to_v.weight.data
-                    org_to_v_bias = org_to_v.bias.data if org_to_v.bias is not None else None
+                        print(f"[MODIFY] {name}: cross_attention_dim {module.cross_attention_dim} → {new_cross_attention_dim}")
 
-                    # 새로운 cross_attention_dim에 맞게 Linear 레이어 생성
-                    module.to_k = nn.Linear(new_cross_attention_dim, module.inner_kv_dim,
-                                            bias=org_to_k.bias is not None).to(org_to_k.weight.device)
-                    module.to_v = nn.Linear(new_cross_attention_dim, module.inner_kv_dim,
-                                            bias=org_to_v.bias is not None).to(org_to_v.weight.device)
+                        org_to_k = module.to_k
+                        org_to_v = module.to_v
 
-                    # 기존 weight를 앞부분에 복사 (추가된 차원은 초기화된 채 유지)
-                    with torch.no_grad():
-                        module.to_k.weight[:, :org_to_k_weight.shape[1]] = org_to_k_weight
-                        module.to_v.weight[:, :org_to_v_weight.shape[1]] = org_to_v_weight
+                        # 기존 파라미터 추출
+                        org_to_k_weight = org_to_k.weight.data
+                        org_to_k_bias = org_to_k.bias.data if org_to_k.bias is not None else None
 
-                        if org_to_k_bias is not None:
-                            module.to_k.bias.copy_(org_to_k_bias)
-                        if org_to_v_bias is not None:
-                            module.to_v.bias.copy_(org_to_v_bias)
+                        org_to_v_weight = org_to_v.weight.data
+                        org_to_v_bias = org_to_v.bias.data if org_to_v.bias is not None else None
 
+                        # 새로운 cross_attention_dim에 맞게 Linear 레이어 생성
+                        module.to_k = nn.Linear(new_cross_attention_dim, module.inner_kv_dim,
+                                                bias=org_to_k.bias is not None).to(org_to_k.weight.device)
+                        module.to_v = nn.Linear(new_cross_attention_dim, module.inner_kv_dim,
+                                                bias=org_to_v.bias is not None).to(org_to_v.weight.device)
 
+                        # 기존 weight를 앞부분에 복사 (추가된 차원은 초기화된 채 유지)
+                        with torch.no_grad():
+                            module.to_k.weight[:, :org_to_k_weight.shape[1]] = org_to_k_weight
+                            module.to_v.weight[:, :org_to_v_weight.shape[1]] = org_to_v_weight
 
-        modify_cross_attention_with_keyvector(unet, new_dim)
+                            if org_to_k_bias is not None:
+                                module.to_k.bias.copy_(org_to_k_bias)
+                            if org_to_v_bias is not None:
+                                module.to_v.bias.copy_(org_to_v_bias)
+            modify_cross_attention_with_keyvector(unet, new_dim)
+
 
     print(f'in change_unet_structure → scnet: {scnet}')
     return unet, scnet, mask_processor
@@ -562,7 +564,11 @@ def main(args):
                                   num_training_steps=num_training_steps_for_scheduler, )
 
     key_concept = "more"
+    #key_vector = text_encoder(tokenize_captions([key_concept], tokenizer, padding_method=False))[0] [:,1:-1,:]
     key_vector = text_encoder(tokenize_captions([key_concept], tokenizer))[0]
+    print(f'tokenized_key_concept: {key_vector.shape}')
+    exit()
+
 
 
 
@@ -654,8 +660,10 @@ def main(args):
             with (accelerator.accumulate(unet)):
                 class_labels = batch["labels"].to(device=accelerator.device)
                 # key_vector
+
                 # [B, 1, 1] shape으로 broadcast용 scale factor 만들기
-                scale_factors = class_labels.view(-1, 1, 1)
+                scale_factors = class_labels.view(-1, 1, 1) * args.concept_alpha
+
                 # key_vector broadcast → [B, 77, 768]
                 key_vectors = key_vector.to(device=accelerator.device, dtype = weight_dtype) * scale_factors  # [B, 77, 768]
                 # [1] target
@@ -668,7 +676,10 @@ def main(args):
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
                 encoder_hidden_states = text_encoder(batch["input_ids"])[0]
                 if args.train_key_concept :
-                    encoder_hidden_states = torch.cat((encoder_hidden_states, key_vectors), dim=-1)
+                    if args.dimension_concat :
+                        encoder_hidden_states = torch.cat((encoder_hidden_states, key_vectors), dim=-1)
+                    else :
+                        encoder_hidden_states = torch.cat((encoder_hidden_states, key_vectors), dim=1)
                 #print(f'after concat, encoder_hidden_states = {encoder_hidden_states.shape}')
                 # --------------------------------------------------------------------------------------------------------
                 # [2.1] image condition
@@ -681,7 +692,10 @@ def main(args):
 
                     null_conditioning = text_encoder(tokenize_captions([""], tokenizer).to(accelerator.device))[0]
                     if args.train_key_concept :
-                        null_conditioning = torch.cat((null_conditioning, null_conditioning), dim=-1)
+                        if args.dimension_concat :
+                            null_conditioning = torch.cat((null_conditioning, null_conditioning), dim=-1)
+                        else :
+                            null_conditioning = torch.cat((null_conditioning, null_conditioning), dim=1)
 
                     encoder_hidden_states = torch.where(prompt_mask,
                                                         null_conditioning,
@@ -911,7 +925,8 @@ if __name__ == "__main__":
     parser.add_argument("--test_13", action="store_true", help="Run test case 13 (label: 0 if label==1 else 1)")
     parser.add_argument("--test_23", action="store_true", help="Run test case 13 (label: 0 if label==1 else 1)")
     parser.add_argument("--train_key_concept", action="store_true")
-
+    parser.add_argument("--concept_alpha", type = float, default = 1.0)
+    parser.add_argument("--train_key_concept", action="store_true")
     args = parser.parse_args()
 
     # Sync local rank with env if needed

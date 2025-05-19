@@ -3,10 +3,10 @@
 export MODEL_NAME="timbrooks/instruct-pix2pix"
 export ACCELERATE_FIND_UNUSED_PARAMETERS=true
 export main_process_port=51205
-config_file="acc_1.yaml"
+config_file="acc_3.yaml"
 disaster="flood"
 export DATASET_ID="ParkSY/FSCM_Flood"
-file_name="1_only_labeling_unconditional_prob_0.5_minus_class_reverse"
+file_name="1_labeling_with_depth_unconditional_prob_0.5_minus_class_reverse"
 
 accelerate launch \
   --config_file ../accelerate_config/$config_file \
@@ -27,9 +27,9 @@ accelerate launch \
   --lr_warmup_steps=0 \
   --max_grad_norm=1 \
   --wandb_project_name="cctv_project" \
-  --wandb_name="labeling_unconditional_prob_0.5_minus_class_reverse" \
+  --wandb_name="labeling_with_depth_unconditional_prob_0.5_minus_class_reverse" \
   --output_dir="../result/$disaster/$file_name" \
   --checkpointing_steps=50 \
   --checkpoints_total_limit=50 \
   --seed 42 \
-  --conditioning_dropout_prob=0.05
+  --conditioning_dropout_prob=0.05 --use_depthmap
